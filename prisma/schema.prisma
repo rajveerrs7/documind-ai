@@ -1,0 +1,210 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// DocuMind AI — Prisma Schema
+//
+// Architecture note:
+//   - Prisma manages: Users, Auth sessions, Document metadata,
+//     Chat history, Messages, Usage tracking
+//   - LangChain PGVector manages: The actual vector embeddings
+//     in the "document_embeddings" table (created by LangChain, not Prisma)
+//   - We link vectors to Prisma Documents via metadata field in PGVector
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider        = "prisma-client-js"
+  // Enable preview features needed for full-text search
+  previewFeatures = ["fullTextSearch", "fullTextIndex"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Main connection URL (can use PgBouncer/pooler)
+  url       = env("DATABASE_URL")
+  // Direct connection for migrations (bypasses PgBouncer)
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum DocumentStatus {
+  PENDING     // Uploaded but not yet processed
+  PROCESSING  // Currently being chunked + embedded
+  READY       // Available for chat queries
+  FAILED      // Processing failed
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USER MODEL
+// Core tenant entity. Every piece of data links back to a User.
+// Multi-tenancy is enforced at the application layer by always
+// filtering queries with userId.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  // bcrypt hashed password — never store plaintext
+  password  String
+  name      String?
+  role      Role     @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  documents Document[]
+  chats     Chat[]
+  usages    Usage[]
+
+  // Indexes
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOCUMENT MODEL
+// Stores metadata about each uploaded PDF.
+// The actual file is stored on disk (or cloud storage in production).
+// Embeddings are stored in PGVector with this document's id in metadata.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Document {
+  id          String         @id @default(cuid())
+  userId      String
+  // Original filename shown in UI
+  filename    String
+  // File path on disk / storage path
+  storagePath String
+  // File size in bytes
+  fileSize    Int
+  // MIME type (should always be application/pdf)
+  mimeType    String         @default("application/pdf")
+  // Processing status
+  status      DocumentStatus @default(PENDING)
+  // Total number of pages in the PDF
+  pageCount   Int?
+  // Total number of chunks created from this document
+  chunkCount  Int?
+  // Error message if processing failed
+  errorMessage String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  // Relations
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // A document can be used in multiple chat sessions
+  chats    Chat[]    @relation("DocumentChats")
+  messages Message[]
+
+  // Indexes for performance
+  // userId index is critical for multi-tenant isolation
+  @@index([userId])
+  @@index([status])
+  @@index([userId, status])
+  @@map("documents")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHAT MODEL
+// Represents a chat session. One chat can be about one document.
+// A user can have many chats, each linked to one document.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Chat {
+  id         String   @id @default(cuid())
+  userId     String
+  documentId String
+  // Human-readable title (auto-generated from first message)
+  title      String   @default("New Chat")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document  @relation("DocumentChats", fields: [documentId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  // Indexes
+  @@index([userId])
+  @@index([documentId])
+  @@index([userId, documentId])
+  @@map("chats")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MESSAGE MODEL
+// Individual messages in a chat conversation.
+// Stores the raw content, role, and citations for assistant messages.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Message {
+  id         String      @id @default(cuid())
+  chatId     String
+  userId     String
+  documentId String
+  role       MessageRole
+  // The message text content
+  content    String      @db.Text
+  // JSON array of citation objects: [{page, text, score}]
+  // Stored as Json type for flexible schema
+  citations  Json?
+  // Token counts for this specific message
+  inputTokens  Int @default(0)
+  outputTokens Int @default(0)
+  createdAt  DateTime    @default(now())
+
+  // Relations
+  chat     Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  // Indexes
+  @@index([chatId])
+  @@index([userId])
+  @@index([documentId])
+  // For chronological message retrieval within a chat
+  @@index([chatId, createdAt])
+  @@map("messages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USAGE MODEL
+// Tracks token consumption per user per month.
+// Used to enforce the free tier limit of 50,000 tokens/month.
+// Each record represents one API call's usage.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Usage {
+  id           String   @id @default(cuid())
+  userId       String
+  // Month in YYYY-MM format for easy monthly aggregation
+  month        String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  // Total = input + output, stored for quick lookup
+  totalTokens  Int      @default(0)
+  // What triggered this usage (chat, embedding, etc.)
+  action       String   @default("chat")
+  createdAt    DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Indexes
+  @@index([userId])
+  // Critical: used to calculate monthly usage quickly
+  @@index([userId, month])
+  @@index([month])
+  @@map("usages")
+}
