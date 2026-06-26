@@ -113,20 +113,24 @@ export async function DELETE(
       where: { id },
     });
 
-    // 3. Delete physical file from disk
-    const absolutePath = path.join(
-      process.cwd(),
-      "public",
-      document.storagePath,
-    );
+    // 3. Delete physical file from disk if it still exists.
+    // Temp-only uploads are cleaned up right after ingestion, so this is
+    // a best-effort no-op for those records.
+    if (document.storagePath.startsWith("uploads/")) {
+      const absolutePath = path.join(
+        process.cwd(),
+        "public",
+        document.storagePath,
+      );
 
-    if (existsSync(absolutePath)) {
-      try {
-        await unlink(absolutePath);
-        console.log(`[Documents/DELETE] File deleted: ${document.storagePath}`);
-      } catch (fileError) {
-        // Log but don't fail the request
-        console.error("[Documents/DELETE] Failed to delete file:", fileError);
+      if (existsSync(absolutePath)) {
+        try {
+          await unlink(absolutePath);
+          console.log(`[Documents/DELETE] File deleted: ${document.storagePath}`);
+        } catch (fileError) {
+          // Log but don't fail the request
+          console.error("[Documents/DELETE] Failed to delete file:", fileError);
+        }
       }
     }
 

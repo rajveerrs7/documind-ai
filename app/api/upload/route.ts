@@ -7,7 +7,7 @@
 //   1. Authenticate user (JWT from middleware headers)
 //   2. Parse multipart form data
 //   3. Validate file (size, type, content)
-//   4. Save file to disk
+//   4. Save file to temporary disk storage
 //   5. Create Document record in Prisma (status: PENDING)
 //   6. Trigger async processing pipeline:
 //      a. Load PDF (LangChain PDFLoader)
@@ -27,9 +27,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { NextRequest, NextResponse } from "next/server";
-import { writeFile, mkdir } from "fs/promises";
+import { writeFile, mkdir, rm } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
 import { prisma } from "@/lib/prisma/client";
 import { DocumentStatus } from "@prisma/client";
 import {
@@ -163,12 +165,10 @@ export async function POST(request: NextRequest) {
     .slice(0, 255);
 
   // ── Generate storage path ─────────────────────────────────
-  const timestamp = Date.now();
-  const uniqueFilename = `${timestamp}-${sanitizedFilename}`;
-  const relativeDir = path.join("uploads", userId);
-  const relativePath = path.join(relativeDir, uniqueFilename);
-  const absoluteDir = path.join(process.cwd(), "public", relativeDir);
-  const absolutePath = path.join(process.cwd(), "public", relativePath);
+  const tempDir = path.join(tmpdir(), "documind-ai");
+  const tempFilename = `${Date.now()}-${randomUUID()}-${sanitizedFilename}`;
+  const tempPath = path.join(tempDir, tempFilename);
+  const storagePath = path.join("temp", userId, tempFilename);
 
   // ── Create Document record (PENDING) ─────────────────────
   // We create the DB record BEFORE saving the file so we have
@@ -177,7 +177,7 @@ export async function POST(request: NextRequest) {
     data: {
       userId,
       filename: sanitizedFilename,
-      storagePath: relativePath,
+      storagePath,
       fileSize: file.size,
       mimeType,
       status: DocumentStatus.PENDING,
@@ -187,19 +187,19 @@ export async function POST(request: NextRequest) {
   // Update cache with initial status
   await setDocumentProcessingStatus(document.id, DocumentStatus.PENDING);
 
-  // ── Save file to disk ─────────────────────────────────────
+  // ── Save file to temporary storage ────────────────────────
   try {
     // Ensure upload directory exists
-    if (!existsSync(absoluteDir)) {
-      await mkdir(absoluteDir, { recursive: true });
+    if (!existsSync(tempDir)) {
+      await mkdir(tempDir, { recursive: true });
     }
 
-    // Convert File to Buffer and write to disk
+    // Convert File to Buffer and write to temp storage
     const fileBuffer = Buffer.from(await file.arrayBuffer());
-    await writeFile(absolutePath, fileBuffer);
+    await writeFile(tempPath, fileBuffer);
 
     console.log(
-      `[Upload] File saved: ${relativePath} (${(file.size / 1024).toFixed(1)}KB)`,
+      `[Upload] Temp file created for ingestion: ${tempFilename} (${(file.size / 1024).toFixed(1)}KB)`,
     );
   } catch (error) {
     // Clean up DB record if file save fails
@@ -225,7 +225,7 @@ export async function POST(request: NextRequest) {
 
     // Step 1 & 2: Load PDF and split into chunks
     const { chunks, pageCount, chunkCount } = await processPdfDocument(
-      absolutePath,
+      tempPath,
       document.id,
     );
 
@@ -299,5 +299,11 @@ export async function POST(request: NextRequest) {
       },
       { status: 422 },
     );
+  } finally {
+    try {
+      await rm(tempPath, { force: true });
+    } catch (cleanupError) {
+      console.warn("[Upload] Temp file cleanup failed:", cleanupError);
+    }
   }
 }
